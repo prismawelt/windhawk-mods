@@ -2,7 +2,7 @@
 // @id              translucent-windows
 // @name            Translucent Windows
 // @description     Enables native translucent effects in Windows 11
-// @version         1.8.2.3
+// @version         1.8.2.12
 // @author          Undisputed00x
 // @github          https://github.com/Undisputed00x
 // @include         *
@@ -4756,7 +4756,6 @@ BOOL CThemeCache::CacheSpinButton(INT iPartId, INT iStateId, INT stateIndex)
     return TRUE;
 }
 
-
 HRESULT WINAPI HookedDrawThemeBackground(
     HTHEME hTheme,
     HDC hdc,
@@ -6268,15 +6267,76 @@ VOID WinbrandHooks()
     }
 }
 
-// Imitate the internal pseudohandle logic and replace gpsi pointer with GetSysColorBrush getter API.
-BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
-{    
-    ULONG_PTR pseudoSystemBrush = (ULONG_PTR)hbr - 1;
-    if (pseudoSystemBrush <= 30)
-        return FillRect_orig(hdc, lprc, GetSysColorBrush((INT)pseudoSystemBrush));    
+// ==LegacyGdiSolidFill==
+// Keep solid foreground fills premultiplied on the glass surface. A DC_BRUSH
+// gets its color from the destination DC, not from GetObject's LOGBRUSH color.
+static BOOL PaintSolidRectWithAlpha(HDC dest, LPCRECT rect, COLORREF color)
+{
+    const DWORD savedError = GetLastError();
+    const int64_t width = static_cast<int64_t>(rect->right) - rect->left;
+    const int64_t height = static_cast<int64_t>(rect->bottom) - rect->top;
+    if (width <= 0 || height <= 0 || width > INT_MAX || height > INT_MAX ||
+        (color & 0xff000000u) != 0)
+        return FALSE;
+    const DWORD type = GetObjectType(dest);
+    if (type != OBJ_DC && type != OBJ_MEMDC)
+        return FALSE;
 
+    HDC source = CreateCompatibleDC(dest);
+    if (!source)
+        return FALSE;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = 1;
+    bmi.bmiHeader.biHeight = -1;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    RGBQUAD* pixel = nullptr;
+    HBITMAP bitmap = CreateDIBSection(source, &bmi, DIB_RGB_COLORS,
+                                     reinterpret_cast<void**>(&pixel), nullptr, 0);
+    HGDIOBJ oldBitmap = bitmap ? SelectObject(source, bitmap) : nullptr;
+    BOOL result = FALSE;
+    if (bitmap && pixel && oldBitmap && oldBitmap != HGDI_ERROR) {
+        *pixel = {GetBValue(color), GetGValue(color), GetRValue(color), 255};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        SetLastError(savedError);
+        result = AlphaBlend(dest, rect->left, rect->top,
+                            static_cast<int>(width), static_cast<int>(height),
+                            source, 0, 0, 1, 1, blend);
+    }
+    const DWORD resultError = GetLastError();
+    if (oldBitmap && oldBitmap != HGDI_ERROR)
+        SelectObject(source, oldBitmap);
+    if (bitmap)
+        DeleteObject(bitmap);
+    DeleteDC(source);
+    SetLastError(resultError);
+    return result;
+}
+
+// Resolve pseudo system brushes as before. Dynamic solid fills also need alpha;
+// this includes control outlines and selection borders, independent of the app.
+BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
+{
+    const DWORD savedError = GetLastError();
+    static const HBRUSH dcBrush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    if (hbr == dcBrush && hdc && lprc &&
+        g_settings.FillBg && !g_settings.Unload &&
+        g_settings.BgType != g_settings.Default &&
+        GetDeviceCaps(hdc, TECHNOLOGY) == DT_RASDISPLAY) {
+        COLORREF color = GetDCBrushColor(hdc);
+        SetLastError(savedError);
+        if (PaintSolidRectWithAlpha(hdc, lprc, color))
+            return TRUE;
+    }
+
+    SetLastError(savedError);
+    ULONG_PTR pseudoSystemBrush = reinterpret_cast<ULONG_PTR>(hbr) - 1;
+    if (pseudoSystemBrush <= 30)
+        return FillRect_orig(hdc, lprc, GetSysColorBrush(static_cast<INT>(pseudoSystemBrush)));
     return FillRect_orig(hdc, lprc, hbr);
 }
+// ==/LegacyGdiSolidFill==
 
 // Paint the explorer dialogs bottom part background
 BOOL (__fastcall *SetDarkThemeColors_orig)(void **, HDC);
@@ -6385,6 +6445,100 @@ VOID Comdlg32Hooks()
     }
 }
 
+
+// ==LegacyGdiAlphaBlend==
+static decltype(&AlphaBlend) AlphaBlend_orig = AlphaBlend;
+
+BOOL WINAPI HookedLegacyAlphaBlend(HDC dest, int x, int y, int width, int height,
+                                  HDC source, int sourceX, int sourceY,
+                                  int sourceWidth, int sourceHeight,
+                                  BLENDFUNCTION blend)
+{
+    const DWORD savedError = GetLastError();
+    auto original = [&]() {
+        SetLastError(savedError);
+        return AlphaBlend_orig(dest, x, y, width, height, source, sourceX,
+                               sourceY, sourceWidth, sourceHeight, blend);
+    };
+    // Normalize constant-alpha GDI drawing to the premultiplied representation
+    // already used by the mod. Leave native per-pixel blends unchanged.
+    if (!g_settings.FillBg || g_settings.Unload ||
+        g_settings.BgType == g_settings.Default ||
+        blend.BlendOp != AC_SRC_OVER || blend.BlendFlags != 0 ||
+        blend.AlphaFormat != 0 || blend.SourceConstantAlpha == 0 ||
+        width <= 0 || height <= 0 || sourceWidth <= 0 || sourceHeight <= 0 ||
+        source == dest || GetObjectType(source) != OBJ_MEMDC ||
+        GetDeviceCaps(dest, TECHNOLOGY) != DT_RASDISPLAY ||
+        GetMapMode(source) != MM_TEXT ||
+        GetGraphicsMode(source) != GM_COMPATIBLE)
+        return original();
+
+    HGDIOBJ sourceBitmap = GetCurrentObject(source, OBJ_BITMAP);
+    if (!sourceBitmap || sourceBitmap == GetCurrentObject(dest, OBJ_BITMAP))
+        return original();
+
+    // The destination DC and coordinates are passed straight through, so its
+    // native mapping, world transform and clipping must remain in effect.
+    // Copy only the source rectangle, not the scaled destination or whole window.
+    // Keep unusually large requests on the native path.
+    if (sourceWidth > 16384 || sourceHeight > 16384 ||
+        static_cast<uint64_t>(sourceWidth) * sourceHeight > 16u * 1024u * 1024u)
+        return original();
+    BITMAP info = {};
+    POINT viewport = {}, window = {};
+    if (GetObjectW(sourceBitmap, sizeof(info), &info) != sizeof(info) ||
+        !GetViewportOrgEx(source, &viewport) || !GetWindowOrgEx(source, &window))
+        return original();
+    const int64_t left = static_cast<int64_t>(sourceX) + viewport.x - window.x;
+    const int64_t top = static_cast<int64_t>(sourceY) + viewport.y - window.y;
+    if (left < 0 || top < 0 || left + sourceWidth > info.bmWidth ||
+        top + sourceHeight > info.bmHeight)
+        return original();
+
+    HDC bufferDC = CreateCompatibleDC(source);
+    if (!bufferDC)
+        return original();
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = sourceWidth;
+    bmi.bmiHeader.biHeight = -sourceHeight;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    RGBQUAD* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(bufferDC, &bmi, DIB_RGB_COLORS,
+                                     reinterpret_cast<void**>(&pixels), nullptr, 0);
+    HGDIOBJ oldBitmap = bitmap ? SelectObject(bufferDC, bitmap) : nullptr;
+    BOOL result;
+    if (bitmap && pixels && oldBitmap && oldBitmap != HGDI_ERROR &&
+        BitBlt(bufferDC, 0, 0, sourceWidth, sourceHeight,
+               source, sourceX, sourceY, SRCCOPY) && GdiFlush()) {
+        const UINT alpha = blend.SourceConstantAlpha;
+        const size_t count = static_cast<size_t>(sourceWidth) * sourceHeight;
+        for (size_t i = 0; i < count; ++i) {
+            RGBQUAD& px = pixels[i];
+            px.rgbBlue = static_cast<BYTE>((px.rgbBlue * alpha + 127u) / 255u);
+            px.rgbGreen = static_cast<BYTE>((px.rgbGreen * alpha + 127u) / 255u);
+            px.rgbRed = static_cast<BYTE>((px.rgbRed * alpha + 127u) / 255u);
+            px.rgbReserved = static_cast<BYTE>(alpha);
+        }
+        BLENDFUNCTION premultiplied = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        SetLastError(savedError);
+        result = AlphaBlend_orig(dest, x, y, width, height, bufferDC,
+                                 0, 0, sourceWidth, sourceHeight, premultiplied);
+    } else {
+        result = original();
+    }
+    const DWORD resultError = GetLastError();
+    if (oldBitmap && oldBitmap != HGDI_ERROR)
+        SelectObject(bufferDC, oldBitmap);
+    if (bitmap)
+        DeleteObject(bitmap);
+    DeleteDC(bufferDC);
+    SetLastError(resultError);
+    return result;
+}
+// ==/LegacyGdiAlphaBlend==
+
 VOID CustomRenderingHooks()
 {
     InitDirect2D();
@@ -6411,6 +6565,11 @@ VOID CustomRenderingHooks()
     WindhawkUtils::SetFunctionHook(DrawTextWithGlow, HookedDrawTextWithGlow, &DrawTextWithGlow);
     WindhawkUtils::SetFunctionHook(DrawTextW, HookedDrawTextW, &DrawTextW_orig);
     WindhawkUtils::SetFunctionHook(ExtTextOutW, HookedExtTextOutW, &ExtTextOutW_orig);
+    // Native controls use GdiAlphaBlend as well as the msimg32 entry point.
+    auto gdiAlphaBlend = reinterpret_cast<decltype(&AlphaBlend)>(GetProcAddress(
+        GetModuleHandleW(L"gdi32.dll"), "GdiAlphaBlend"));
+    WindhawkUtils::SetFunctionHook(gdiAlphaBlend ? gdiAlphaBlend : AlphaBlend,
+                                  HookedLegacyAlphaBlend, &AlphaBlend_orig);
     WindhawkUtils::SetFunctionHook(DrawThemeText, HookedDrawThemeText, &DrawThemeText_orig);
     WindhawkUtils::SetFunctionHook(DrawThemeTextEx, HookedDrawThemeTextEx, &DrawThemeTextEx_orig);
     UxThemeHooks(g_settings.FlyoutsEffects);
