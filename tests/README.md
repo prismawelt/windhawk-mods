@@ -29,6 +29,12 @@ continue to receive their normal update checks.
 This is an installation adaptation: only the source id/name differ from the
 published fix in this repository. The rendering functions remain identical.
 
+Save the installed source as UTF-8 **without a BOM**. Windhawk 1.7.3 anchors its
+metadata opening marker at the start of a line; a BOM before the first marker
+causes "Couldn't find a metadata block in the source code". Verify the source
+with the installed UI metadata parser as well as the compiler: compiling alone
+does not detect this UI loading failure.
+
 ## Reproduce the native checks
 
 Use Windhawk's Windows compiler. From WSL, supply a Windows-drive temporary directory
