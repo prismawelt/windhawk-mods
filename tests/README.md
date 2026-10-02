@@ -2,7 +2,7 @@
 
 This fork keeps the mod's existing BGRA8 GDI/Direct2D rendering and native acrylic
 backdrop. It repairs missing alpha in text, empty selection fills, constant-alpha
-blends, and dynamic DC_BRUSH foreground fills. Unsupported ItemsView parts/states
+blends, dynamic DC_BRUSH foreground fills, and solid system carets. Unsupported ItemsView parts/states
 fall back to native theming without indexing or poisoning a cache. Premultiplication,
 BITMAPINFO initialization, and system-color restoration are corrected.
 
@@ -53,6 +53,9 @@ injected; injecting the mod into its own test would invalidate the comparison.
       python3 tests/run-translucent-windows-solid-fill.py \
         --compiler '/mnt/c/Program Files/Windhawk/Compiler/bin/clang++.exe' \
         --temp-dir /path/to/excluded/windows-directory --target "$target"
+      python3 tests/run-translucent-windows-caret.py \
+        --compiler '/mnt/c/Program Files/Windhawk/Compiler/bin/clang++.exe' \
+        --temp-dir /path/to/excluded/windows-directory --target "$target"
     done
 
 Each runner also accepts --source. In the standalone fix package, add
@@ -67,12 +70,27 @@ across 32-bit and 64-bit builds. They cover exact RGB/alpha, selection bounds,
 clipping, mapping/world transforms, RTL fills, fallback behavior, source/DC state,
 and GDI object stability over 1,000 repeated draws.
 
+The caret fixture adds 35 checks per architecture. It uses real glass windows and
+the same NtUser caret entry points called by native controls. It covers native
+blinking, exact RGB/alpha on transparent, partial-alpha and opaque backgrounds,
+movement, repainting, nested hide/show counts, allocation/subclass fallback,
+owner destruction, cross-thread unload, and GDI object stability over 500 cycles.
+Application bitmap carets and gray patterns retain their native behavior.
+
+For an optional installed-mod check, add --injected-temp-dir with a Windows-drive
+directory where mod injection is enabled. This runs a real Edit control twice:
+the excluded baseline reproduces 00FFFFFF while the installed version produces
+FFFFFFFF during native blinking. The binary must load a mod DLL with the version
+from the supplied source. Both focus-cycle tests check for GDI leaks. Across both
+architectures and the 64-bit installed-control comparison, 218 checks passed.
+
 ## Display and resource verification
 
 On the affected laptop, Advanced Color remained enabled and output remained
 10 bpc. The user confirmed Word selection backgrounds during the fix and Explorer's marquee
 interior and original pink border on the physical display with production version 1.8.2.12.
-Screen captures alone do not validate this display-path issue.
+The user also confirmed the Explorer rename insertion caret on the physical
+display with version 1.8.2.13. Screen captures alone do not validate this display-path issue.
 
 The source remains BGRA8, as required by the existing DC render target. Display
 output depth and source-buffer depth are different; this change does not create
@@ -88,3 +106,25 @@ In the native 64-bit fixture, repairing the observed blend added about 60 micros
 per call, and repairing four thin border fills added about 65 microseconds total.
 Repeated tests leaked no GDI objects. These are local drawing microbenchmarks,
 not whole-application CPU/GPU or battery measurements.
+
+## Solid caret rendering
+
+Windows draws a default solid caret with XOR. Repairing text/selection alpha does
+not repair that primitive: the original caret in the native fixture is 00FFFFFF
+while shown on a transparent black background. A 32-bit XOR bitmap supplies the
+missing alpha mask. Each pixel uses backgroundAlpha XOR 255 in its alpha byte and
+FFFFFF in its RGB bytes. Native drawing makes the shown caret opaque, and native
+hiding restores the original RGB and alpha exactly, including opaque backgrounds.
+
+Only the active solid caret of each participating GUI thread retains a small
+bitmap and memory DC. The mask is refreshed while hidden at movement, show and
+paint boundaries; it is deselected before Windows uses it for blinking. Windows
+still handles blink timing, DPI, client clipping and position. No polling timer,
+overlay window, full-window surface or FP16 renderer is added. The ordinary
+3 x 24 test caret uses 288 pixel bytes; the actual Edit control used 1 x 32 pixels,
+or 128 pixel bytes. GDI/DC and map bookkeeping are additional.
+
+Native calls are intercepted in win32u when available because native controls
+bypass user32's public wrappers. The window subclass restores the original caret
+on unload and releases resources on destruction. Unsupported custom bitmap/gray
+carets and resource failures use native rendering.

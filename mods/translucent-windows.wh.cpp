@@ -2,7 +2,7 @@
 // @id              translucent-windows
 // @name            Translucent Windows
 // @description     Enables native translucent effects in Windows 11
-// @version         1.8.2.12
+// @version         1.8.2.13
 // @author          Undisputed00x
 // @github          https://github.com/Undisputed00x
 // @include         *
@@ -175,6 +175,8 @@ This is caused by default by the AccentBlur API.❕
 #include <cmath>
 #include <string>
 #include <array>
+#include <unordered_map>
+#include <vector>
 #include <d2d1.h>
 #include <wrl.h>
 #include <ShellScalingApi.h>
@@ -6539,9 +6541,255 @@ BOOL WINAPI HookedLegacyAlphaBlend(HDC dest, int x, int y, int width, int height
 }
 // ==/LegacyGdiAlphaBlend==
 
+// ==LegacyGdiCaret==
+// A solid system caret is an XOR mask. RGB is inverted by Windows, but the
+// default mask leaves alpha at zero on glass. Supply a per-pixel alpha XOR mask:
+// backgroundAlpha ^ (backgroundAlpha ^ 255) == 255 while visible, and the
+// second native XOR restores the exact background. Windows owns blink timing.
+static decltype(&CreateCaret) CreateCaret_orig = CreateCaret;
+static decltype(&DestroyCaret) DestroyCaret_orig = DestroyCaret;
+static decltype(&SetCaretPos) SetCaretPos_orig = SetCaretPos;
+static decltype(&ShowCaret) ShowCaret_orig = ShowCaret;
+static decltype(&HideCaret) HideCaret_orig = HideCaret;
+
+struct LegacyCaretSurface {
+    HWND window;
+    DWORD thread;
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    DWORD* pixels = nullptr;
+    int width, height;
+    UINT hideCount = 1; // CreateCaret starts hidden.
+    ~LegacyCaretSurface() {
+        if (oldBitmap && oldBitmap != HGDI_ERROR) SelectObject(dc, oldBitmap);
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+    }
+};
+static SRWLOCK g_caretLock = SRWLOCK_INIT;
+static std::unordered_map<DWORD, std::shared_ptr<LegacyCaretSurface>> g_caretSurfaces;
+static UINT g_caretRestoreMessage = RegisterWindowMessageW(
+    L"Windhawk_TranslucentWindows_RestoreCaret_" WH_MOD_ID);
+
+static std::shared_ptr<LegacyCaretSurface> FindLegacyCaret() {
+    AcquireSRWLockShared(&g_caretLock);
+    auto it = g_caretSurfaces.find(GetCurrentThreadId());
+    auto result = it == g_caretSurfaces.end() ? nullptr : it->second;
+    ReleaseSRWLockShared(&g_caretLock);
+    return result;
+}
+static bool IsLegacyCaretCurrent(const LegacyCaretSurface& caret,
+                                 GUITHREADINFO& info) {
+    info = {sizeof(info)};
+    return GetGUIThreadInfo(caret.thread, &info) &&
+           info.hwndCaret == caret.window &&
+           info.rcCaret.right - info.rcCaret.left == caret.width &&
+           info.rcCaret.bottom - info.rcCaret.top == caret.height;
+}
+static void UpdateLegacyCaretMask(LegacyCaretSurface& caret) {
+    GUITHREADINFO info;
+    if (!IsLegacyCaretCurrent(caret, info)) return;
+    HGDIOBJ previous = SelectObject(caret.dc, caret.bitmap);
+    if (!previous || previous == HGDI_ERROR) return;
+    const size_t count = static_cast<size_t>(caret.width) * caret.height;
+    // Unreadable/clipped pixels keep the native alpha behavior.
+    GdiFlush();
+    std::fill_n(caret.pixels, count, 0xFFFFFFFFu);
+    HDC source = GetDC(caret.window);
+    bool copied = source &&
+        BitBlt(caret.dc, 0, 0, caret.width, caret.height, source,
+               info.rcCaret.left, info.rcCaret.top, SRCCOPY) && GdiFlush();
+    if (source) ReleaseDC(caret.window, source);
+    for (size_t i = 0; i < count; ++i) {
+        caret.pixels[i] = copied ?
+            ((caret.pixels[i] ^ 0xFF000000u) | 0x00FFFFFFu) : 0x00FFFFFFu;
+    }
+    // The kernel selects this bitmap into its own DC when blinking.
+    SelectObject(caret.dc, previous);
+}
+static LRESULT CALLBACK LegacyCaretSubclass(HWND, UINT, WPARAM, LPARAM,
+                                           UINT_PTR, DWORD_PTR);
+static void ForgetLegacyCaret(const std::shared_ptr<LegacyCaretSurface>& caret,
+                              bool restore) {
+    GUITHREADINFO info;
+    if (restore && IsLegacyCaretCurrent(*caret, info)) {
+        // Recreate the original solid caret before releasing its bitmap.
+        if (CreateCaret_orig(caret->window, nullptr, caret->width, caret->height)) {
+            SetCaretPos_orig(info.rcCaret.left, info.rcCaret.top);
+            if (!caret->hideCount) ShowCaret_orig(caret->window);
+            else for (UINT i = 1; i < caret->hideCount; ++i)
+                HideCaret_orig(caret->window);
+        } else {
+            DestroyCaret_orig();
+        }
+    }
+    RemoveWindowSubclass(caret->window, LegacyCaretSubclass,
+                         reinterpret_cast<UINT_PTR>(LegacyCaretSubclass));
+    AcquireSRWLockExclusive(&g_caretLock);
+    auto it = g_caretSurfaces.find(caret->thread);
+    if (it != g_caretSurfaces.end() && it->second == caret) g_caretSurfaces.erase(it);
+    ReleaseSRWLockExclusive(&g_caretLock);
+}
+static LRESULT CALLBACK LegacyCaretSubclass(HWND window, UINT message,
+                                           WPARAM wParam, LPARAM lParam,
+                                           UINT_PTR, DWORD_PTR) {
+    auto caret = FindLegacyCaret();
+    if (caret && caret->window == window) {
+        if (message == g_caretRestoreMessage || message == WM_NCDESTROY) {
+            if (message == WM_NCDESTROY) {
+                GUITHREADINFO info;
+                if (IsLegacyCaretCurrent(*caret, info)) DestroyCaret_orig();
+            }
+            ForgetLegacyCaret(caret, message == g_caretRestoreMessage);
+        } else if (message == WM_PAINT && !g_settings.Unload) {
+            const BOOL hidden = HideCaret_orig(window);
+            LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+            if (hidden && FindLegacyCaret() == caret) {
+                UpdateLegacyCaretMask(*caret);
+                ShowCaret_orig(window);
+            }
+            return result;
+        }
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+static BOOL WINAPI HookedCreateCaret(HWND window, HBITMAP bitmap,
+                                    int width, int height) {
+    BOOL result = CreateCaret_orig(window, bitmap, width, height);
+    const DWORD error = GetLastError();
+    if (!result) return result;
+    if (auto previous = FindLegacyCaret()) ForgetLegacyCaret(previous, false);
+    // Application bitmap and gray patterned carets retain their native shape.
+    if (!bitmap && window && !g_settings.Unload && g_settings.FillBg &&
+        g_settings.BgType != g_settings.Default &&
+        IsWindowEligible(GetAncestor(window, GA_ROOT))) {
+        GUITHREADINFO info = {sizeof(info)};
+        if (GetGUIThreadInfo(GetCurrentThreadId(), &info) &&
+            info.hwndCaret == window) {
+            width = info.rcCaret.right - info.rcCaret.left;
+            height = info.rcCaret.bottom - info.rcCaret.top;
+            // Bound custom shapes; ordinary insertion carets are only a few pixels wide.
+            if (width > 0 && height > 0 && width <= 512 && height <= 4096 &&
+                static_cast<size_t>(width) * height <= 1024 * 1024) {
+                auto caret = std::make_shared<LegacyCaretSurface>();
+                caret->window = window; caret->thread = GetCurrentThreadId();
+                caret->width = width; caret->height = height;
+                caret->dc = CreateCompatibleDC(nullptr);
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = width; bmi.bmiHeader.biHeight = -height;
+                bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32;
+                if (caret->dc) caret->bitmap = CreateDIBSection(
+                    caret->dc, &bmi, DIB_RGB_COLORS,
+                    reinterpret_cast<void**>(&caret->pixels), nullptr, 0);
+                if (caret->bitmap) {
+                    caret->oldBitmap = SelectObject(caret->dc, caret->bitmap);
+                    if (caret->oldBitmap && caret->oldBitmap != HGDI_ERROR)
+                        SelectObject(caret->dc, caret->oldBitmap);
+                }
+                if (caret->pixels && caret->oldBitmap && caret->oldBitmap != HGDI_ERROR &&
+                    SetWindowSubclass(window, LegacyCaretSubclass,
+                        reinterpret_cast<UINT_PTR>(LegacyCaretSubclass), 0)) {
+                    UpdateLegacyCaretMask(*caret);
+                    if (CreateCaret_orig(window, caret->bitmap, 0, 0)) {
+                        AcquireSRWLockExclusive(&g_caretLock);
+                        g_caretSurfaces[caret->thread] = caret;
+                        ReleaseSRWLockExclusive(&g_caretLock);
+                    } else {
+                        RemoveWindowSubclass(window, LegacyCaretSubclass,
+                            reinterpret_cast<UINT_PTR>(LegacyCaretSubclass));
+                        CreateCaret_orig(window, nullptr, width, height);
+                    }
+                }
+            }
+        }
+    }
+    SetLastError(error);
+    return result;
+}
+static BOOL WINAPI HookedSetCaretPos(int x, int y) {
+    auto caret = FindLegacyCaret();
+    GUITHREADINFO info;
+    if (!caret || !IsLegacyCaretCurrent(*caret, info))
+        return SetCaretPos_orig(x, y);
+    const DWORD savedError = GetLastError();
+    const BOOL hidden = HideCaret_orig(caret->window);
+    SetLastError(savedError);
+    BOOL result = SetCaretPos_orig(x, y);
+    const DWORD error = GetLastError();
+    if (hidden) {
+        if (result) UpdateLegacyCaretMask(*caret);
+        ShowCaret_orig(caret->window);
+    }
+    SetLastError(error);
+    return result;
+}
+static BOOL WINAPI HookedShowCaret(HWND window) {
+    const DWORD savedError = GetLastError();
+    auto caret = FindLegacyCaret();
+    GUITHREADINFO info;
+    if (caret && (!window || window == caret->window) &&
+        IsLegacyCaretCurrent(*caret, info) && HideCaret_orig(caret->window)) {
+        UpdateLegacyCaretMask(*caret);
+        ShowCaret_orig(caret->window);
+    }
+    SetLastError(savedError);
+    BOOL result = ShowCaret_orig(window);
+    const DWORD error = GetLastError();
+    if (result && caret && (!window || window == caret->window) && caret->hideCount)
+        --caret->hideCount;
+    SetLastError(error);
+    return result;
+}
+static BOOL WINAPI HookedHideCaret(HWND window) {
+    const DWORD savedError = GetLastError();
+    auto caret = FindLegacyCaret();
+    SetLastError(savedError);
+    BOOL result = HideCaret_orig(window);
+    const DWORD error = GetLastError();
+    if (result && caret && (!window || window == caret->window) &&
+        caret->hideCount < UINT_MAX) ++caret->hideCount;
+    SetLastError(error);
+    return result;
+}
+static BOOL WINAPI HookedDestroyCaret() {
+    BOOL result = DestroyCaret_orig();
+    const DWORD error = GetLastError();
+    if (result) if (auto caret = FindLegacyCaret()) ForgetLegacyCaret(caret, false);
+    SetLastError(error);
+    return result;
+}
+static void RestoreLegacyCarets() {
+    std::vector<std::shared_ptr<LegacyCaretSurface>> carets;
+    AcquireSRWLockShared(&g_caretLock);
+    for (const auto& [thread, caret] : g_caretSurfaces) carets.push_back(caret);
+    ReleaseSRWLockShared(&g_caretLock);
+    for (const auto& caret : carets) {
+        if (GetWindowThreadProcessId(caret->window, nullptr) == caret->thread)
+            SendMessageW(caret->window, g_caretRestoreMessage, 0, 0);
+    }
+}
+// ==/LegacyGdiCaret==
+
 VOID CustomRenderingHooks()
 {
     InitDirect2D();
+    // Native edit controls call win32u directly, bypassing user32's API wrappers.
+    auto caretTarget = [](const char* name, auto fallback) {
+        auto address = GetProcAddress(GetModuleHandleW(L"win32u.dll"), name);
+        return address ? reinterpret_cast<decltype(fallback)>(address) : fallback;
+    };
+    WindhawkUtils::SetFunctionHook(caretTarget("NtUserCreateCaret", CreateCaret),
+                                  HookedCreateCaret, &CreateCaret_orig);
+    WindhawkUtils::SetFunctionHook(caretTarget("NtUserDestroyCaret", DestroyCaret),
+                                  HookedDestroyCaret, &DestroyCaret_orig);
+    WindhawkUtils::SetFunctionHook(caretTarget("NtUserSetCaretPos", SetCaretPos),
+                                  HookedSetCaretPos, &SetCaretPos_orig);
+    WindhawkUtils::SetFunctionHook(caretTarget("NtUserShowCaret", ShowCaret),
+                                  HookedShowCaret, &ShowCaret_orig);
+    WindhawkUtils::SetFunctionHook(caretTarget("NtUserHideCaret", HideCaret),
+                                  HookedHideCaret, &HideCaret_orig);
     #ifdef _WIN64
         CplDuiHook();
     #endif
@@ -6804,6 +7052,12 @@ VOID Wh_ModAfterInit()
     BOOL isInitialThread = *(USHORT*)((BYTE*)NtCurrentTeb() + OFFSET_SAME_TEB_FLAGS) & 0x0400;
     if (!isInitialThread)
         ApplyForExistingWindows();
+}
+
+VOID Wh_ModBeforeUninit()
+{
+    g_settings.Unload = TRUE;
+    RestoreLegacyCarets();
 }
 
 VOID Wh_ModUninit(VOID) 
