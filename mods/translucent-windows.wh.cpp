@@ -2,7 +2,7 @@
 // @id              translucent-windows
 // @name            Translucent Windows
 // @description     Enables native translucent effects in Windows 11
-// @version         1.8.2
+// @version         1.8.2.3
 // @author          Undisputed00x
 // @github          https://github.com/Undisputed00x
 // @include         *
@@ -919,9 +919,9 @@ BOOL ExtTextOutComposition(HDC hdc, HPAINTBUFFER hpb, LPCRECT pTextRect)
             // Gamma alpha correction
             BYTE txtA = g_textAlphaGammaLUT[luma];
             
-            px.rgbBlue     = (pxBlue * txtA) >> 8;
-            px.rgbGreen    = (pxGreen * txtA) >> 8;
-            px.rgbRed      = (pxRed * txtA) >> 8;
+            px.rgbBlue     = static_cast<BYTE>((static_cast<UINT>(pxBlue) * txtA + 127u) / 255u);
+            px.rgbGreen    = static_cast<BYTE>((static_cast<UINT>(pxGreen) * txtA + 127u) / 255u);
+            px.rgbRed      = static_cast<BYTE>((static_cast<UINT>(pxRed) * txtA + 127u) / 255u);
             px.rgbReserved = txtA;
         }
     }
@@ -1004,12 +1004,25 @@ BOOL ExtTextOutCalcRect(HDC hdc, POINT point, UINT options, RECT& textRect,
 
 BOOL ExtTextOutShouldSkip(HDC hdc, UINT options, LPCRECT lprect, LPCWSTR lpString, INT c)
 {
-    if (!hdc || !lpString || !c || !options || GetTextAlign(hdc) & TA_UPDATECP)
+    // Zero options is a valid unflagged text call and still needs alpha repair.
+    if (!hdc || !lpString || !c || (GetTextAlign(hdc) & TA_UPDATECP))
         return TRUE;
     
     if (options & (ETO_OPAQUE | ETO_CLIPPED) && (!lprect || IsRectEmpty(lprect)))
         return TRUE;
-    
+
+    // The buffer bounds are in untransformed pixels. Preserve the native path
+    // for newly handled unflagged calls that use scaling, transforms or rotation.
+    if (!options)
+    {
+        if (GetMapMode(hdc) != MM_TEXT || GetGraphicsMode(hdc) != GM_COMPATIBLE)
+            return TRUE;
+        LOGFONTW font = {};
+        if (GetObjectW(GetCurrentObject(hdc, OBJ_FONT), sizeof(font), &font) != sizeof(font) ||
+            font.lfEscapement || font.lfOrientation)
+            return TRUE;
+    }
+
     return FALSE;
 }
 
@@ -1023,6 +1036,16 @@ BOOL WINAPI HookedExtTextOutW(
     UINT c,
     const INT* lpDx)
 {   
+    // Edit controls can paint the selection with ETO_OPAQUE and no characters.
+    // Native GDI fills RGB only, so preserve the selection background's alpha.
+    if (hdc && c == 0 && (options & ETO_OPAQUE) && lprect &&
+        !IsRectEmpty(lprect) && GetBkColor(hdc) == GetSysColor(COLOR_HIGHLIGHT))
+    {
+        if (ExtTextOutBkPaint(hdc, lprect, options))
+            return TRUE;
+        return ExtTextOutW_orig(hdc, x, y, options, lprect, lpString, c, lpDx);
+    }
+
     if (ExtTextOutShouldSkip(hdc, options, lprect, lpString, c))
         return ExtTextOutW_orig(hdc, x, y, options, lprect, lpString, c, lpDx);
 
@@ -1248,7 +1271,7 @@ VOID RevertSysColors()
     COLORREF aNewColors[ARRAYSIZE(SysColorElements)];
 
     for (UINT i = 0; i < ARRAYSIZE(SysColorElements); i++) 
-        aNewColors[i] = GetThemeSysColor(hThemeSysMetrics, i); 
+        aNewColors[i] = GetThemeSysColor(hThemeSysMetrics, SysColorElements[i]);
     SetSysColors(ARRAYSIZE(SysColorElements), SysColorElements, aNewColors); 
 
     CloseThemeData(hThemeSysMetrics);
@@ -1824,7 +1847,7 @@ public:
         if (!(elementHdc = CreateCompatibleDC(NULL)))
             return FALSE;
 
-        BITMAPINFO bmi;
+        BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = Width;
         bmi.bmiHeader.biHeight = -Height;
@@ -3737,19 +3760,24 @@ BOOL CThemeCache::CacheTreeViewGlyph(INT iPartId, INT iStateId, INT stateIndex, 
 
 BOOL PaintItemsView(HDC hdc, INT iPartId, INT iStateId, LPCRECT pRect)
 {
-    if (!g_d2dFactory || (iPartId != 1 && iPartId != 3 && iPartId != 6
-        && (iPartId != 4 && (iStateId == 11 || iStateId == 12))))
+    // Only handle the parts and states that CacheItemsView actually paints.
+    // Unknown states must reach native theming without populating a shared slot.
+    if (!g_d2dFactory ||
+        !((iPartId == 1 && iStateId >= 1 && iStateId <= 4) ||
+          ((iPartId == 3 || iPartId == 6) &&
+           (iStateId == 1 || iStateId == 2)) ||
+          (iPartId == 4 && (iStateId == 11 || iStateId == 12))))
         return FALSE;
 
-    INT index = (iPartId == 1 && (iStateId % 2 == 1)) ? 0 :
-                (iPartId == 1 && (iStateId % 2 == 0)) ? 1 : (iPartId == 6) ? iStateId + 1 : iStateId + 3;
-    
     // New DarkTheme file conflict dialog buttons
     if (iPartId == 4 && iStateId == 11)
         return PaintListView(hdc, 1, 6, pRect);
     else if (iPartId == 4 && iStateId == 12)
         return PaintListView(hdc, 1, 2, pRect);
-    
+
+    INT index = (iPartId == 1) ? (iStateId - 1) % 2 :
+                (iPartId == 6) ? iStateId + 1 : iStateId + 3;
+
     if (!g_themeCache.itemsview[index])
         if (!g_themeCache.CacheItemsView(iPartId, iStateId, index))
             return FALSE;
@@ -4727,6 +4755,7 @@ BOOL CThemeCache::CacheSpinButton(INT iPartId, INT iStateId, INT stateIndex)
     if (FAILED(hr)) {Wh_Log(L"Failed D2D drawing [ERROR]: 0x%08X\n", hr); return FALSE;}
     return TRUE;
 }
+
 
 HRESULT WINAPI HookedDrawThemeBackground(
     HTHEME hTheme,
@@ -6374,8 +6403,9 @@ VOID CustomRenderingHooks()
     WinbrandHooks();
     User32Hooks(g_settings.SetSystemColors);
     if (!g_settings.SetSystemColors) {
+        // Keep color queries native: applications use them for contrast and theme
+        // decisions. Custom system brushes still supply the glass background.
         WindhawkUtils::SetFunctionHook(FillRect, HookedFillRect, &FillRect_orig);
-        WindhawkUtils::SetFunctionHook(GetSysColor, HookedGetSysColor, &GetSysColor_orig);
         WindhawkUtils::SetFunctionHook(GetSysColorBrush, HookedGetSysColorBrush, &GetSysColorBrush_orig);
     }
     WindhawkUtils::SetFunctionHook(DrawTextWithGlow, HookedDrawTextWithGlow, &DrawTextWithGlow);
