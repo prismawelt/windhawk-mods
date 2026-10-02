@@ -12,6 +12,23 @@ brushes still paint the glass background. This lets applications make normal
 contrast decisions. The fixes use drawing contracts and do not test application
 names, accent colors, or the display bit depth.
 
+## Install a modified version as a local fork
+
+Windhawk 1.7.3 identifies published mods by their installed id. A different source
+version from its cached upstream latestVersion produces an update offer; a higher
+custom version number does not prevent it. A GitHub fork alone does not change
+that installed identity.
+
+Use Windhawk's local-fork identity for the modified installation. On the affected
+laptop, the source metadata id is translucent-windows-fork, its name is
+Translucent Windows - Fork, and its installed id is local@translucent-windows-fork.
+Both DLLs were rebuilt for that identity and existing settings were preserved.
+The original installed id and its stale update entry were removed. Other mods
+continue to receive their normal update checks.
+
+This is an installation adaptation: only the source id/name differ from the
+published fix in this repository. The rendering functions remain identical.
+
 ## Reproduce the native checks
 
 Use Windhawk's Windows compiler. From WSL, supply a Windows-drive temporary directory
