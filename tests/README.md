@@ -2,7 +2,9 @@
 
 This fork keeps the mod's existing BGRA8 GDI/Direct2D rendering and native acrylic
 backdrop. It repairs missing alpha in text, empty selection fills, constant-alpha
-blends, dynamic DC_BRUSH foreground fills, and solid system carets. Unsupported ItemsView parts/states
+blends, dynamic DC_BRUSH foreground fills, and solid system carets. It also
+separates ordinary legacy background erases from foreground drawing during
+window paint messages. Unsupported ItemsView parts/states
 fall back to native theming without indexing or poisoning a cache. Premultiplication,
 BITMAPINFO initialization, and system-color restoration are corrected.
 
@@ -53,6 +55,9 @@ injected; injecting the mod into its own test would invalidate the comparison.
       python3 tests/run-translucent-windows-solid-fill.py \
         --compiler '/mnt/c/Program Files/Windhawk/Compiler/bin/clang++.exe' \
         --temp-dir /path/to/excluded/windows-directory --target "$target"
+      python3 tests/run-translucent-windows-glass-paint.py \
+        --compiler '/mnt/c/Program Files/Windhawk/Compiler/bin/clang++.exe' \
+        --temp-dir /path/to/excluded/windows-directory --target "$target"
       python3 tests/run-translucent-windows-caret.py \
         --compiler '/mnt/c/Program Files/Windhawk/Compiler/bin/clang++.exe' \
         --temp-dir /path/to/excluded/windows-directory --target "$target"
@@ -82,7 +87,10 @@ directory where mod injection is enabled. This runs a real Edit control twice:
 the excluded baseline reproduces 00FFFFFF while the installed version produces
 FFFFFFFF during native blinking. The binary must load a mod DLL with the version
 from the supplied source. Both focus-cycle tests check for GDI leaks. Across both
-architectures and the 64-bit installed-control comparison, 218 checks passed.
+architectures, the glass-paint checks below, and installed-control comparisons
+on both architectures, 282 checks passed. The unchanged alpha-blend functions
+retain their earlier 40 passing checks; their extracted production section is
+byte-identical to version 1.8.2.13.
 
 ## Display and resource verification
 
@@ -90,7 +98,12 @@ On the affected laptop, Advanced Color remained enabled and output remained
 10 bpc. The user confirmed Word selection backgrounds during the fix and Explorer's marquee
 interior and original pink border on the physical display with production version 1.8.2.12.
 The user also confirmed the Explorer rename insertion caret on the physical
-display with version 1.8.2.13. Screen captures alone do not validate this display-path issue.
+display with version 1.8.2.13. With version 1.8.2.17, the user confirmed that the iCloud Photos Options
+dialog retained its transparency and readable text without the reported fringes.
+A live readback found zero pixels with RGB exceeding alpha in the dialog and its
+visible children. Clipped or occluded readback regions can return zero, so this
+measurement supplements the physical confirmation. Screen captures alone do not
+validate this display-path issue.
 
 The source remains BGRA8, as required by the existing DC render target. Display
 output depth and source-buffer depth are different; this change does not create
@@ -128,3 +141,38 @@ Native calls are intercepted in win32u when available because native controls
 bypass user32's public wrappers. The window subclass restores the original caret
 on unload and releases resources on destruction. Unsupported custom bitmap/gray
 carets and resource failures use native rendering.
+
+## Legacy background and foreground painting
+
+Some legacy controls erase with ordinary RGB or PALETTERGB brushes through
+NtGdiPatBlt/PATCOPY instead of the mod's intercepted system brushes. A neutral
+background drawn that way can leave RGB with zero alpha and text composed against
+a background that no longer matches the native acrylic backdrop.
+
+Version 1.8.2.17 tracks WM_ERASEBKGND, WM_PAINT, WM_PRINT and WM_PRINTCLIENT with
+per-window subclasses and a nested thread-local scope. Only eligible windows
+participate. Neutral erases clear to transparent black, then mark the root window
+as having a glass background. A neutral light whole-clip repaint also preserves
+that backdrop; small foreground fills keep their RGB and receive opaque alpha.
+PALETTERGB is normalized only on devices without a system palette. Patterns,
+palette indices, unrelated raster operations and unowned drawing stay native.
+
+Text uses the existing alpha mask and premultiplication code. On a mapped glass
+background in dark mode, neutral dark text adapts its source color to the actual
+local background; a single destination pixel distinguishes bright content from
+the dark backdrop. Explicit colored text, white text and HDC text-color state are
+preserved. ETO_OPAQUE background clears follow the same glass intent, while the
+existing selection-highlight branch retains its foreground alpha.
+
+The glass-paint fixture adds 30 checks per architecture. It uses real Windows
+paint messages, subclasses, palette-relative brushes, foreground rectangles and
+text-color queries against the extracted production functions. It checks
+transparent background pixels, exact foreground RGB/alpha, nesting, native
+fallbacks, settings and unload behavior, and stable GDI counts over 100 repaints.
+
+This adds window/property bookkeeping and scoped drawing work, without polling,
+a new renderer or a full-window buffer. Foreground fills reuse the existing
+single-pixel helper. Disabling custom rendering restores native drawing; unloading
+also removes the subclasses and properties. An experiment that made every
+background opaque was rejected because it removed transparency; that behavior is
+not in the final version.

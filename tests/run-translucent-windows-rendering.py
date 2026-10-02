@@ -36,6 +36,17 @@ prefix = r"""
 #define RECTHEIGHT(r) ((r)->bottom - (r)->top)
 #define Wh_Log(...) std::fwprintf(stderr, __VA_ARGS__)
 static decltype(&ExtTextOutW) ExtTextOutW_orig = &ExtTextOutW;
+
+#define WH_MOD_ID L"translucent-windows-fixture"
+#include <commctrl.h>
+struct { bool FillBg=true;bool Unload=false;enum Type{Default,Blur}BgType=Blur;}g_settings;
+bool g_IsSysThemeDarkMode=true;
+BOOL IsWindowEligible(HWND h){return h!=nullptr;}
+namespace WindhawkUtils {
+using WH_SUBCLASSPROC=LRESULT(CALLBACK*)(HWND,UINT,WPARAM,LPARAM,DWORD_PTR);
+BOOL SetWindowSubclassFromAnyThread(HWND,WH_SUBCLASSPROC,DWORD_PTR){return FALSE;}
+void RemoveWindowSubclassFromAnyThread(HWND,WH_SUBCLASSPROC){}
+}
 """
 cases = [('fixed', args.source)]
 if args.baseline:
@@ -62,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix='.windhawk-rendering-tests-', dir=args.t
                 target = 'x86_64-w64-mingw32' if arch == '64' else 'i686-w64-mingw32'
                 compile_result = subprocess.run([
                     args.compiler, '-std=c++23', '-O2', '-target', target, windows_path(cpp),
-                    '-o', windows_path(exe), '-lgdi32', '-luxtheme', '-lmsimg32', '-static'
+                    '-o', windows_path(exe), '-lgdi32', '-luxtheme', '-lcomctl32', '-lmsimg32', '-static'
                 ], capture_output=True, timeout=120)
                 if compile_result.returncode:
                     print(compile_result.stderr.decode('utf-8', 'replace'))

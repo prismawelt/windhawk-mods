@@ -21,7 +21,17 @@ prefix=r"""
 #include <cstdint>
 #include <climits>
 #include <initializer_list>
+#define WH_MOD_ID L"translucent-windows-fixture"
+#include <commctrl.h>
 struct {bool FillBg=true;bool Unload=false;enum Type{Default,Blur}BgType=Blur;}g_settings;
+bool g_IsSysThemeDarkMode=true;
+BOOL IsWindowEligible(HWND h){return h!=nullptr;}
+namespace WindhawkUtils {
+using WH_SUBCLASSPROC=LRESULT(CALLBACK*)(HWND,UINT,WPARAM,LPARAM,DWORD_PTR);
+BOOL SetWindowSubclassFromAnyThread(HWND,WH_SUBCLASSPROC,DWORD_PTR){return FALSE;}
+void RemoveWindowSubclassFromAnyThread(HWND,WH_SUBCLASSPROC){}
+}
+
 static decltype(&FillRect) FillRect_orig=FillRect;
 bool forceBlendFailure=false;
 int lastWidth=0,lastHeight=0;
@@ -38,8 +48,9 @@ def wp(path):
 with tempfile.TemporaryDirectory(prefix='.windhawk-solid-tests-',dir=a.temp_dir) as tmp:
  t=Path(tmp);cpp=t/'solid.cpp';exe=t/'solid.exe'
  body=(Path(__file__).resolve().parent/'translucent-windows-solid-fill.cpp').read_text(encoding='utf-8')
- cpp.write_text(prefix+helper+'\n#undef AlphaBlend\n'+body,encoding='utf-8')
- r=subprocess.run([a.compiler,'-std=c++23','-O2','-target',a.target,wp(cpp),'-o',wp(exe),'-lgdi32','-lmsimg32','-static'],capture_output=True,timeout=120)
+ context=s.split('// ==LegacyGdiGlassPaint==\n',1)[1].split('// ==/LegacyGdiGlassPaint==',1)[0]
+ cpp.write_text(prefix+context+helper+'\n#undef AlphaBlend\n'+body,encoding='utf-8')
+ r=subprocess.run([a.compiler,'-std=c++23','-O2','-target',a.target,wp(cpp),'-o',wp(exe),'-lgdi32','-lcomctl32','-lmsimg32','-static'],capture_output=True,timeout=120)
  print('compile',r.returncode,flush=True)
  if r.returncode:print(r.stderr.decode('utf-8','replace'));sys.exit(2)
  r=subprocess.run([str(exe)],capture_output=True,timeout=60);output=r.stdout.decode('utf-8','replace');print(output,flush=True)

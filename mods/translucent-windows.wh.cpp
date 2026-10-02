@@ -2,7 +2,7 @@
 // @id              translucent-windows
 // @name            Translucent Windows
 // @description     Enables native translucent effects in Windows 11
-// @version         1.8.2.13
+// @version         1.8.2.17
 // @author          Undisputed00x
 // @github          https://github.com/Undisputed00x
 // @include         *
@@ -456,6 +456,7 @@ static decltype(&FillRect) FillRect_orig = nullptr;
 static decltype(&DrawThemeEdge) DrawThemeEdge_orig = nullptr;
 static decltype(&DefWindowProcW) DefWindowProc_orig = nullptr;
 
+void AttachLegacyGlassPainting(HWND);
 VOID NewWindowShown(HWND);
 VOID HandleEffects(HWND hWnd);
 
@@ -817,8 +818,10 @@ HWND WINAPI HookedNtUserCreateWindowEx(DWORD dwExStyle,
         x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam,
         dwShowMode, dwUnknown1, dwUnknown2, qwUnknown3);
     
-    if(hWnd)
+    if(hWnd) {
+        AttachLegacyGlassPainting(hWnd);
         NewWindowShown(hWnd);
+    }
 
     return hWnd;
 }
@@ -858,6 +861,133 @@ VOID GenerateTextAlphaGammaLUT()
     }
 }
 
+// ==LegacyGdiGlassPaint==
+static constexpr wchar_t kLegacyGlassBackground[] =
+    L"Windhawk.TranslucentWindows.GlassBackground." WH_MOD_ID;
+struct LegacyGlassPaintScope {
+    HWND window;
+    HDC eraseDC;
+    LegacyGlassPaintScope* previous;
+    static thread_local LegacyGlassPaintScope* current;
+    LegacyGlassPaintScope(HWND owner, HDC erase) :
+        window(owner), eraseDC(erase), previous(current) { current = this; }
+    ~LegacyGlassPaintScope() { current = previous; }
+};
+thread_local LegacyGlassPaintScope* LegacyGlassPaintScope::current = nullptr;
+
+bool HasLegacyGlassBackground(HDC dc)
+{
+    const DWORD error = GetLastError();
+    HWND owner = WindowFromDC(dc);
+    if (!owner && LegacyGlassPaintScope::current)
+        owner = LegacyGlassPaintScope::current->window;
+    bool result = owner && GetPropW(GetAncestor(owner, GA_ROOT), kLegacyGlassBackground);
+    SetLastError(error);
+    return result && g_settings.FillBg && !g_settings.Unload &&
+           g_settings.BgType != g_settings.Default;
+}
+
+bool IsLegacyGlassErase(HDC dc, COLORREF color)
+{
+    auto scope = LegacyGlassPaintScope::current;
+    const BYTE r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
+    return scope && scope->eraseDC == dc && r == g && g == b &&
+           g_settings.FillBg && !g_settings.Unload &&
+           g_settings.BgType != g_settings.Default;
+}
+
+bool IsLegacyGlassBackgroundFill(HDC dc, COLORREF color, LPCRECT rect)
+{
+    if (IsLegacyGlassErase(dc, color))
+        return true;
+    // Some controls erase again in WM_PAINT. Recognize a neutral whole-clip
+    // background only after this window's erase established the glass backdrop.
+    if (!LegacyGlassPaintScope::current || !HasLegacyGlassBackground(dc) ||
+        GetRValue(color) != GetGValue(color) || GetGValue(color) != GetBValue(color) ||
+        GetRValue(color) < 224 || !rect)
+        return false;
+    RECT clip = {};
+    int kind = GetClipBox(dc, &clip);
+    return kind != ERROR && kind != NULLREGION &&
+        rect->left <= clip.left && rect->top <= clip.top &&
+        rect->right >= clip.right && rect->bottom >= clip.bottom;
+}
+
+void MarkLegacyGlassBackground()
+{
+    if (auto scope = LegacyGlassPaintScope::current)
+        SetPropW(GetAncestor(scope->window, GA_ROOT), kLegacyGlassBackground,
+                 reinterpret_cast<HANDLE>(1));
+}
+
+COLORREF LegacyGlassTextColor(HDC dc, COLORREF color, LPCRECT rect)
+{
+    // Adapt dark neutral text only after this window's light background was
+    // replaced by the native backdrop. Explicit colors and white text survive.
+    BYTE value = GetRValue(color);
+    if (g_IsSysThemeDarkMode && value < 128 && GetGValue(color) == value &&
+        GetBValue(color) == value && HasLegacyGlassBackground(dc)) {
+        const DWORD error = GetLastError();
+        COLORREF background = rect ? GetPixel(dc, rect->left, rect->top) : CLR_INVALID;
+        SetLastError(error);
+        if (background == CLR_INVALID ||
+            (GetRValue(background) + 2 * GetGValue(background) + GetBValue(background)) < 512)
+            return RGB(255 - value, 255 - value, 255 - value);
+    }
+    return color;
+}
+
+LRESULT CALLBACK LegacyGlassPaintSubclass(HWND window, UINT message,
+                                           WPARAM wParam, LPARAM lParam, DWORD_PTR)
+{
+    if (message == WM_NCDESTROY)
+        RemovePropW(window, kLegacyGlassBackground);
+    if (!g_settings.Unload &&
+        (message == WM_PAINT || message == WM_PRINT || message == WM_PRINTCLIENT ||
+         message == WM_ERASEBKGND)) {
+        LegacyGlassPaintScope scope(window, message == WM_ERASEBKGND ?
+            reinterpret_cast<HDC>(wParam) : nullptr);
+        return DefSubclassProc(window, message, wParam, lParam);
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void AttachLegacyGlassPainting(HWND window)
+{
+    if (g_settings.FillBg && !g_settings.Unload &&
+        g_settings.BgType != g_settings.Default &&
+        IsWindowEligible(GetAncestor(window, GA_ROOT)))
+        WindhawkUtils::SetWindowSubclassFromAnyThread(window, LegacyGlassPaintSubclass, 0);
+}
+
+BOOL CALLBACK LegacyGlassChild(HWND window, LPARAM)
+{
+    if (g_settings.Unload) {
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(window, LegacyGlassPaintSubclass);
+        RemovePropW(window, kLegacyGlassBackground);
+    } else {
+        AttachLegacyGlassPainting(window);
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK LegacyGlassCleanup(HWND window, LPARAM)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == GetCurrentProcessId()) {
+        LegacyGlassChild(window, 0);
+        EnumChildWindows(window, LegacyGlassChild, 0);
+    }
+    return TRUE;
+}
+
+void RestoreLegacyGlassPainting()
+{
+    EnumWindows(LegacyGlassCleanup, 0);
+}
+// ==/LegacyGdiGlassPaint==
+
 BOOL ExtTextOutBkPaint(HDC hdc, LPCRECT lprect, UINT options)
 {
     if (!(options & ETO_OPAQUE)) 
@@ -883,9 +1013,15 @@ BOOL ExtTextOutBkPaint(HDC hdc, LPCRECT lprect, UINT options)
         }
     }
     else {
-        HBRUSH brush = CreateSolidBrush(GetBkColor(hdc));
-        FillRect(hdc, lprect, brush);
-        DeleteObject(brush);
+        const COLORREF color = GetBkColor(hdc);
+        if (HasLegacyGlassBackground(hdc) && GetRValue(color) == GetGValue(color) &&
+            GetGValue(color) == GetBValue(color)) {
+            FillRect(hdc, lprect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        } else {
+            HBRUSH brush = CreateSolidBrush(color);
+            FillRect(hdc, lprect, brush);
+            DeleteObject(brush);
+        }
     }
     return TRUE;
 }
@@ -903,9 +1039,10 @@ BOOL ExtTextOutComposition(HDC hdc, HPAINTBUFFER hpb, LPCRECT pTextRect)
     INT txtRcHeight = RECTHEIGHT(pTextRect);
     INT txtRcWidth = RECTWIDTH(pTextRect);
     
-    BYTE pxBlue = GetBValue(GetTextColor(hdc));
-    BYTE pxGreen = GetGValue(GetTextColor(hdc));
-    BYTE pxRed = GetRValue(GetTextColor(hdc));
+    const COLORREF textColor = LegacyGlassTextColor(hdc, GetTextColor(hdc), pTextRect);
+    BYTE pxBlue = GetBValue(textColor);
+    BYTE pxGreen = GetGValue(textColor);
+    BYTE pxRed = GetRValue(textColor);
     
     // Alpha composition
     for (INT cy = 0; cy < txtRcHeight; ++cy) {
@@ -1041,7 +1178,8 @@ BOOL WINAPI HookedExtTextOutW(
     // Edit controls can paint the selection with ETO_OPAQUE and no characters.
     // Native GDI fills RGB only, so preserve the selection background's alpha.
     if (hdc && c == 0 && (options & ETO_OPAQUE) && lprect &&
-        !IsRectEmpty(lprect) && GetBkColor(hdc) == GetSysColor(COLOR_HIGHLIGHT))
+        !IsRectEmpty(lprect) &&
+        (GetBkColor(hdc) == GetSysColor(COLOR_HIGHLIGHT) || HasLegacyGlassBackground(hdc)))
     {
         if (ExtTextOutBkPaint(hdc, lprect, options))
             return TRUE;
@@ -5292,6 +5430,8 @@ VOID NewWindowShown(HWND hWnd)
         return;        
     //else
         //Wh_Log(L"Eligible window: %p", hWnd);
+    AttachLegacyGlassPainting(hWnd);
+    EnumChildWindows(hWnd, LegacyGlassChild, 0);
     HandleEffects(hWnd);
 }
 
@@ -6322,6 +6462,37 @@ BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
 {
     const DWORD savedError = GetLastError();
     static const HBRUSH dcBrush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    if (hdc && lprc && LegacyGlassPaintScope::current &&
+        g_settings.FillBg && !g_settings.Unload &&
+        g_settings.BgType != g_settings.Default &&
+        GetDeviceCaps(hdc, TECHNOLOGY) == DT_RASDISPLAY) {
+        LOGBRUSH brush = {};
+        COLORREF color = CLR_INVALID;
+        if (hbr == dcBrush)
+            color = GetDCBrushColor(hdc);
+        else if (GetObjectW(hbr, sizeof(brush), &brush) == sizeof(brush) &&
+                 brush.lbStyle == BS_SOLID)
+            color = brush.lbColor;
+        if ((color & 0xff000000u) == 0x02000000u &&
+            !(GetDeviceCaps(hdc, RASTERCAPS) & RC_PALETTE))
+            color &= 0x00ffffffu;
+        if ((color & 0xff000000u) == 0 &&
+            IsLegacyGlassBackgroundFill(hdc, color, lprc)) {
+            SetLastError(savedError);
+            BOOL result = FillRect_orig(hdc, lprc,
+                static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            const DWORD error = GetLastError();
+            if (result) MarkLegacyGlassBackground();
+            SetLastError(error);
+            return result;
+        }
+        if ((color & 0xff000000u) == 0 && color != 0 &&
+            HasLegacyGlassBackground(hdc)) {
+            SetLastError(savedError);
+            if (PaintSolidRectWithAlpha(hdc, lprc, color))
+                return TRUE;
+        }
+    }
     if (hbr == dcBrush && hdc && lprc &&
         g_settings.FillBg && !g_settings.Unload &&
         g_settings.BgType != g_settings.Default &&
@@ -6338,6 +6509,58 @@ BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
         return FillRect_orig(hdc, lprc, GetSysColorBrush(static_cast<INT>(pseudoSystemBrush)));
     return FillRect_orig(hdc, lprc, hbr);
 }
+static decltype(&PatBlt) PatBlt_orig = PatBlt;
+
+BOOL WINAPI HookedLegacyPatBlt(HDC hdc, int x, int y, int width, int height, DWORD rop)
+{
+    const DWORD savedError = GetLastError();
+    if (rop == PATCOPY && hdc && width > 0 && height > 0 &&
+        g_settings.FillBg && !g_settings.Unload &&
+        g_settings.BgType != g_settings.Default &&
+        GetDeviceCaps(hdc, TECHNOLOGY) == DT_RASDISPLAY) {
+        HBRUSH brush = static_cast<HBRUSH>(GetCurrentObject(hdc, OBJ_BRUSH));
+        LOGBRUSH info = {};
+        COLORREF color = CLR_INVALID;
+        static const HBRUSH dcBrush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+        if (brush == dcBrush)
+            color = GetDCBrushColor(hdc);
+        else if (GetObjectW(brush, sizeof(info), &info) == sizeof(info) &&
+                 info.lbStyle == BS_SOLID)
+            color = info.lbColor;
+        // Palette-relative RGB is ordinary RGB on true-color display devices.
+        if ((color & 0xff000000u) == 0x02000000u &&
+            !(GetDeviceCaps(hdc, RASTERCAPS) & RC_PALETTE))
+            color &= 0x00ffffffu;
+        const int64_t right = static_cast<int64_t>(x) + width;
+        const int64_t bottom = static_cast<int64_t>(y) + height;
+        RECT rect = {x, y, right <= INT_MAX ? static_cast<LONG>(right) : INT_MAX,
+                     bottom <= INT_MAX ? static_cast<LONG>(bottom) : INT_MAX};
+        if (right <= INT_MAX && bottom <= INT_MAX &&
+            (color & 0xff000000u) == 0 &&
+            IsLegacyGlassBackgroundFill(hdc, color, &rect)) {
+            HGDIOBJ old = SelectObject(hdc, GetStockObject(BLACK_BRUSH));
+            if (old && old != HGDI_ERROR) {
+                SetLastError(savedError);
+                BOOL result = PatBlt_orig(hdc, x, y, width, height, rop);
+                const DWORD error = GetLastError();
+                SelectObject(hdc, old);
+                if (result) MarkLegacyGlassBackground();
+                SetLastError(error);
+                return result;
+            }
+        }
+        if (LegacyGlassPaintScope::current && HasLegacyGlassBackground(hdc) &&
+            (color & 0xff000000u) == 0 && (color != 0 || brush == dcBrush) &&
+            right <= INT_MAX && bottom <= INT_MAX) {
+            SetLastError(savedError);
+            if (PaintSolidRectWithAlpha(hdc, &rect, color))
+                return TRUE;
+        }
+    }
+    SetLastError(savedError);
+    return PatBlt_orig(hdc, x, y, width, height, rop);
+}
+
 // ==/LegacyGdiSolidFill==
 
 // Paint the explorer dialogs bottom part background
@@ -6810,6 +7033,10 @@ VOID CustomRenderingHooks()
         WindhawkUtils::SetFunctionHook(FillRect, HookedFillRect, &FillRect_orig);
         WindhawkUtils::SetFunctionHook(GetSysColorBrush, HookedGetSysColorBrush, &GetSysColorBrush_orig);
     }
+    auto nativePatBlt = reinterpret_cast<decltype(&PatBlt)>(GetProcAddress(
+        GetModuleHandleW(L"win32u.dll"), "NtGdiPatBlt"));
+    WindhawkUtils::SetFunctionHook(nativePatBlt ? nativePatBlt : PatBlt,
+                                  HookedLegacyPatBlt, &PatBlt_orig);
     WindhawkUtils::SetFunctionHook(DrawTextWithGlow, HookedDrawTextWithGlow, &DrawTextWithGlow);
     WindhawkUtils::SetFunctionHook(DrawTextW, HookedDrawTextW, &DrawTextW_orig);
     WindhawkUtils::SetFunctionHook(ExtTextOutW, HookedExtTextOutW, &ExtTextOutW_orig);
@@ -7058,6 +7285,7 @@ VOID Wh_ModBeforeUninit()
 {
     g_settings.Unload = TRUE;
     RestoreLegacyCarets();
+    RestoreLegacyGlassPainting();
 }
 
 VOID Wh_ModUninit(VOID) 
